@@ -1,9 +1,12 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import faiss
 import json
 import os
+import ast
+import unicodedata
 from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any
 import logging
@@ -13,6 +16,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+CORS(app)
 
 # Global variables to store the model and data
 model = None
@@ -70,14 +74,41 @@ def load_skill_databases():
     if esco_df is None:
         logger.info("Loading ESCO skills database...")
         esco_df = pd.read_csv(ESCO_FILE)
-        esco_df['preferredLabel'] = esco_df['preferredLabel'].str.lower()  # Normalize
+        esco_df['preferredLabel_norm'] = esco_df['preferredLabel'].apply(normalize_term)
     
     if onet_df is None:
         logger.info("Loading O*NET skills database...")
         onet_df = pd.read_csv(ONET_FILE, sep="\t")  # Tab-separated
-        onet_df['Element Name'] = onet_df['Element Name'].str.lower()
+        onet_df['Element Name norm'] = onet_df['Element Name'].apply(normalize_term)
     
     return esco_df, onet_df
+
+def normalize_term(s: str) -> str:
+    """Normalize a term using NFKC normalization, lowercase, and whitespace normalization"""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", str(s)).lower().strip()
+    s = " ".join(s.split())
+    return s
+
+def parse_skills_field(raw):
+    """Parse skills field from various formats (list, string, etc.)"""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return []
+    if isinstance(raw, list):
+        return [str(x) for x in raw if str(x).strip()]
+    s = str(raw).strip()
+    if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
+        try:
+            val = ast.literal_eval(s)
+            if isinstance(val, (list, tuple)):
+                return [str(x) for x in val if str(x).strip()]
+        except Exception:
+            pass
+    for sep in [";", "|", ","]:
+        if sep in s:
+            return [t for t in (part.strip() for part in s.split(sep)) if t]
+    return [s] if s else []
 
 def normalize_skills(raw_skills):
     """
@@ -89,38 +120,35 @@ def normalize_skills(raw_skills):
     Returns:
         tuple: (list of ESCO IDs, dict of O*NET skills with importance)
     """
-    if pd.isna(raw_skills):
-        return [], {}  # Return empty lists for NaN values
-    
     # Load skill databases
     esco_df, onet_df = load_skill_databases()
     
-    # Convert to list if it's a string representation of a list
-    if isinstance(raw_skills, str):
-        if raw_skills.startswith('[') and raw_skills.endswith(']'):
-            # Remove brackets and split by comma
-            skills_text = raw_skills[1:-1]
-            skills_list = [s.strip().strip("'\"") for s in skills_text.split(',') if s.strip()]
-        else:
-            # Treat as comma-separated
-            skills_list = [s.strip() for s in raw_skills.split(',') if s.strip()]
-    else:
-        skills_list = []
+    # Parse skills using the improved parser
+    skills_list = parse_skills_field(raw_skills)
     
-    # Convert to lowercase for matching
-    skills_list = [s.lower() for s in skills_list]
+    # Normalize skills using the same normalization function
+    skills_list_norm = [normalize_term(s) for s in skills_list]
     
-    # Match ESCO skills
-    # Use 'conceptUri' column for ESCO IDs
-    esco_ids = esco_df[esco_df['preferredLabel'].isin(skills_list)]['conceptUri'].tolist()
+    if not skills_list_norm:
+        return [], {}
     
-    # Match O*NET skills
+    # Match ESCO skills using normalized labels
+    mask = esco_df["preferredLabel_norm"].isin(skills_list_norm)
+    esco_ids = esco_df.loc[mask, "conceptUri"].tolist()
+    
+    # Build fast O*NET lookup for importance values
+    onet_importance = (
+        onet_df.groupby("Element Name norm")["Data Value"]
+        .max()
+        .to_dict()
+    )
+    
+    # O*NET match using normalized names
     onet_skills = {}
-    for skill in skills_list:
-        match = onet_df[onet_df['Element Name'] == skill]
-        if not match.empty:
-            # Use 'Data Value' for importance based on the dataframe structure
-            onet_skills[skill] = match['Data Value'].iloc[0]
+    for skill in skills_list_norm:
+        val = onet_importance.get(skill)
+        if val is not None and not (isinstance(val, float) and np.isnan(val)):
+            onet_skills[skill] = float(val)
     
     return esco_ids, onet_skills
 
@@ -137,15 +165,26 @@ def match_job(job_embedding, job_skills, top_k=10, filters=None):
     index = load_index()
     _, metadata = load_data()
     
+    logger.info(f"Index size: {index.ntotal}, Metadata size: {len(metadata)}")
+    logger.info(f"Job skills: {job_skills}")
+    logger.info(f"Filters: {filters}")
+    
     # Normalize job embedding for cosine similarity
     job_embedding_norm = job_embedding / np.linalg.norm(job_embedding)
     
+    # Precompute job normalization ONCE
+    job_esco_ids_list, job_onet_skills = normalize_skills(job_skills)
+    job_esco_ids = set(job_esco_ids_list)
+    job_skills_norm = [normalize_term(s) for s in job_skills]
+    
     # Search the index
     distances, indices = index.search(np.array([job_embedding_norm]), top_k)
+    logger.info(f"FAISS search returned {len(indices[0])} results")
     
     candidates = []
     for i, sim in zip(indices[0], distances[0]):
         if i == -1 or i >= len(metadata):
+            logger.warning(f"Skipping invalid index {i}")
             continue
             
         candidate = metadata[i]
@@ -154,9 +193,32 @@ def match_job(job_embedding, job_skills, top_k=10, filters=None):
         if filters:
             filter_match = True
             for k, v in filters.items():
-                if k not in candidate or candidate.get(k) != v:
-                    filter_match = False
-                    break
+                candidate_value = candidate.get(k)
+                
+                # Handle major_field_of_studies filter specifically
+                if k == 'major_field_of_studies':
+                    # Parse the string representation of the list
+                    if isinstance(candidate_value, str):
+                        try:
+                            # Remove brackets and split by comma, then clean up
+                            if candidate_value.startswith('[') and candidate_value.endswith(']'):
+                                candidate_majors = [s.strip().strip("'\"") for s in candidate_value[1:-1].split(',') if s.strip()]
+                            else:
+                                candidate_majors = [candidate_value.strip()]
+                        except:
+                            candidate_majors = []
+                    else:
+                        candidate_majors = candidate_value if isinstance(candidate_value, list) else []
+                    
+                    # Check if any of the required majors match any of the candidate's majors
+                    if not any(required_major.lower() in [cm.lower() for cm in candidate_majors] for required_major in v):
+                        filter_match = False
+                        break
+                else:
+                    # For other filters, use direct comparison
+                    if k not in candidate or candidate.get(k) != v:
+                        filter_match = False
+                        break
             if not filter_match:
                 continue
         
@@ -165,17 +227,18 @@ def match_job(job_embedding, job_skills, top_k=10, filters=None):
         
         # Calculate skill overlap using ESCO IDs
         candidate_esco_ids = set(candidate.get('esco_ids', []))
-        # For job skills, we need to normalize them first to get ESCO IDs
-        job_esco_ids, job_onet_skills = normalize_skills(', '.join(job_skills))
-        job_esco_ids = set(job_esco_ids)
-        skill_overlap = len(candidate_esco_ids.intersection(job_esco_ids))
+        skill_overlap = len(candidate_esco_ids & job_esco_ids)
         
-        # Calculate ONET skill weight
+        # Calculate ONET skill weight using normalized skill names
         candidate_onet_skills = candidate.get('onet_skills', {})
-        onet_weight = sum(candidate_onet_skills.get(skill, 0) for skill in job_skills)
+        # Use overlap of O*NET names, weighted by candidate importance
+        onet_weight = sum(
+            candidate_onet_skills.get(skill_name, 0) 
+            for skill_name in job_onet_skills.keys()
+        )
         
         # Calculate final score
-        final_score = 0.7 * semantic_score + 0.2 * skill_overlap + 0.1 * onet_weight
+        final_score = 1 * semantic_score + 0.2 * skill_overlap + 0.1 * onet_weight
         
         explanation = "Semantic match"
         if skill_overlap > 0:
@@ -190,12 +253,77 @@ def match_job(job_embedding, job_skills, top_k=10, filters=None):
             'metadata': candidate
         })
     
+    logger.info(f"Returning {len(candidates)} candidates")
     return sorted(candidates, key=lambda x: x['score'], reverse=True)[:top_k]
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({"status": "healthy", "message": "TalentAI API is running"})
+
+@app.route('/test-match', methods=['POST'])
+def test_match():
+    """Simple test endpoint without filters"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"status": "error", "message": "No JSON data provided"}), 400
+        
+        title = data.get('title', '')
+        description = data.get('description', '')
+        skills = data.get('skills', [])
+        top_k = data.get('top_k', 5)
+        
+        # Create job text for embedding
+        job_text = f"{title} {description} {' '.join(skills)}"
+        
+        # Create job embedding
+        model = load_model()
+        job_embedding = create_resume_embedding(job_text)
+        
+        # Match job to candidates without filters
+        candidates = match_job(job_embedding, skills, top_k, None)
+        
+        # Get full candidate information
+        resumes_df, _ = load_data()
+        results = []
+        
+        for candidate in candidates:
+            candidate_id = candidate['candidate_id']
+            if candidate_id < len(resumes_df):
+                candidate_info = resumes_df.iloc[candidate_id].to_dict()
+                
+                # Helper function to handle NaN values
+                def clean_value(value):
+                    if pd.isna(value):
+                        return None
+                    return value
+                
+                result = {
+                    'candidate_id': candidate_id,
+                    'score': candidate['score'],
+                    'explanation': candidate['explanation'],
+                    'career_objective': clean_value(candidate_info.get('career_objective')),
+                    'skills': clean_value(candidate_info.get('skills')),
+                    'educational_institution_name': clean_value(candidate_info.get('educational_institution_name')),
+                    'degree_names': clean_value(candidate_info.get('degree_names')),
+                    'passing_years': clean_value(candidate_info.get('passing_years')),
+                    'major_field_of_studies': clean_value(candidate_info.get('major_field_of_studies')),
+                    'professional_company_names': clean_value(candidate_info.get('professional_company_names'))
+                }
+                results.append(result)
+        
+        return jsonify({
+            "status": "success",
+            "job_title": title,
+            "candidates_found": len(results),
+            "candidates": results
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in test match: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/index', methods=['POST'])
 def rebuild_index():
@@ -234,7 +362,7 @@ def rebuild_index():
         logger.info("Creating metadata...")
         new_metadata = []
         for _, row in resumes_df.iterrows():
-            esco_ids, onet_skills = normalize_skills(row.get('skills', ''))
+            esco_ids, onet_skills = normalize_skills(row.get('skills'))
             
             metadata_entry = {
                 'educational_institution_name': row.get('educational_institution_name', []),
@@ -305,30 +433,41 @@ def match_job_endpoint():
         model = load_model()
         job_embedding = create_resume_embedding(job_text)
         
-        # Match job to candidates
-        candidates = match_job(job_embedding, skills, top_k, filters)
+        # Match job to candidates (temporarily disable filters for debugging)
+        candidates = match_job(job_embedding, skills, top_k, None)  # filters
+        logger.info(f"Found {len(candidates)} candidates from match_job function")
         
         # Get full candidate information
         resumes_df, _ = load_data()
+        logger.info(f"Loaded {len(resumes_df)} resumes from CSV")
         results = []
         
         for candidate in candidates:
             candidate_id = candidate['candidate_id']
             if candidate_id < len(resumes_df):
                 candidate_info = resumes_df.iloc[candidate_id].to_dict()
+                
+                # Helper function to handle NaN values
+                def clean_value(value):
+                    if pd.isna(value):
+                        return None
+                    return value
+                
                 result = {
                     'candidate_id': candidate_id,
                     'score': candidate['score'],
                     'explanation': candidate['explanation'],
-                    'career_objective': candidate_info.get('career_objective'),
-                    'skills': candidate_info.get('skills'),
-                    'educational_institution_name': candidate_info.get('educational_institution_name'),
-                    'degree_names': candidate_info.get('degree_names'),
-                    'passing_years': candidate_info.get('passing_years'),
-                    'major_field_of_studies': candidate_info.get('major_field_of_studies'),
-                    'professional_company_names': candidate_info.get('professional_company_names')
+                    'career_objective': clean_value(candidate_info.get('career_objective')),
+                    'skills': clean_value(candidate_info.get('skills')),
+                    'educational_institution_name': clean_value(candidate_info.get('educational_institution_name')),
+                    'degree_names': clean_value(candidate_info.get('degree_names')),
+                    'passing_years': clean_value(candidate_info.get('passing_years')),
+                    'major_field_of_studies': clean_value(candidate_info.get('major_field_of_studies')),
+                    'professional_company_names': clean_value(candidate_info.get('professional_company_names'))
                 }
                 results.append(result)
+            else:
+                logger.warning(f"Candidate ID {candidate_id} is out of range (max: {len(resumes_df)})")
         
         return jsonify({
             "status": "success",
@@ -386,7 +525,7 @@ def add_resume():
         index.add(np.array([new_embedding_norm]))
         
         # Create metadata entry
-        esco_ids, onet_skills = normalize_skills(skills_text)
+        esco_ids, onet_skills = normalize_skills(skills)
         new_metadata_entry = {
             'educational_institution_name': data.get('educational_institution_name', []),
             'passing_years': data.get('passing_years', []),
